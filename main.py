@@ -8,7 +8,7 @@ app = FastAPI()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# (Opcional) segredo simples pro webhook. Se você não configurar nada, ele aceita sem validação.
+# Se estiver vazio, aceita webhook sem validação.
 WEBHOOK_TOKEN = os.getenv("KIWIFY_WEBHOOK_TOKEN", "").strip()
 
 
@@ -59,48 +59,90 @@ def status(email: str):
             row = cur.fetchone()
             if not row:
                 return {"email": email, "active": False, "found": False}
-            return {"email": row["email"], "active": bool(row["active"]), "found": True, "updated_at": str(row["updated_at"])}
+            return {
+                "email": row["email"],
+                "active": bool(row["active"]),
+                "found": True,
+                "updated_at": str(row["updated_at"]),
+            }
     finally:
         conn.close()
+
+
+def _token_ok(request: Request) -> bool:
+    """
+    Aceita token vindo de:
+    - querystring: ?signature=...
+      (inclusive se vier repetido: signature=a&signature=b)
+    - header: X-Webhook-Token
+    - header: Authorization: Bearer <token>
+    """
+    if not WEBHOOK_TOKEN:
+        return True  # sem validação
+
+    # Query params (pode vir repetido)
+    qs_sigs = [s.strip() for s in request.query_params.getlist("signature") if s]
+    if qs_sigs and WEBHOOK_TOKEN in qs_sigs:
+        return True
+
+    # Header custom
+    hdr_sig = (request.headers.get("X-Webhook-Token", "") or "").strip()
+    if hdr_sig and hdr_sig == WEBHOOK_TOKEN:
+        return True
+
+    # Authorization Bearer
+    hdr_auth = (request.headers.get("Authorization", "") or "").strip()
+    if hdr_auth.lower().startswith("bearer "):
+        bearer = hdr_auth.split(" ", 1)[1].strip()
+        if bearer == WEBHOOK_TOKEN:
+            return True
+
+    return False
 
 
 @app.post("/webhook/kiwify")
 async def kiwify_webhook(request: Request):
-    # Kiwify normalmente envia o token como ?signature=... (querystring)
-    # Seu código antigo esperava X-Webhook-Token no header, por isso dava 401.
-    if WEBHOOK_TOKEN:
-        qs_sigs = [s.strip() for s in request.query_params.getlist("signature") if s]
-        qs_sig_ok = WEBHOOK_TOKEN in qs_sigs
+    # Validação do token
+    if not _token_ok(request):
+        # logs úteis (sem vazar token)
+        qs_sigs = request.query_params.getlist("signature")
+        print("[KIWIFY] 401 - token inválido")
+        print("[KIWIFY] signatures recebidas (qsp):", [("..." if s else "") for s in qs_sigs])
+        print("[KIWIFY] tem X-Webhook-Token header?:", "X-Webhook-Token" in request.headers)
+        print("[KIWIFY] tem Authorization header?:", "Authorization" in request.headers)
+        raise HTTPException(status_code=401, detail="Invalid webhook token")
 
-        hdr_sig = (request.headers.get("X-Webhook-Token", "") or "").strip()
-        hdr_auth = (request.headers.get("Authorization", "") or "").strip()
+    # Parse do JSON
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        # Aceita se QUALQUER um bater:
-        # - query param signature
-        # - header X-Webhook-Token
-        # - header Authorization: Bearer <token>
-        ok = False
-        if qs_sig and qs_sig == WEBHOOK_TOKEN:
-            ok = True
-        elif hdr_sig and hdr_sig == WEBHOOK_TOKEN:
-            ok = True
-        elif hdr_auth.lower().startswith("bearer ") and hdr_auth.split(" ", 1)[1].strip() == WEBHOOK_TOKEN:
-            ok = True
+    # Evento e email (Kiwify pode variar os nomes)
+    event = (data.get("event") or data.get("type") or data.get("evento") or "").strip()
 
-        if not ok:
-            raise HTTPException(status_code=401, detail="Invalid webhook token")
-
-    data = await request.json()
-
-    event = data.get("event") or data.get("type") or ""
     customer = data.get("customer", {}) or {}
-    email = (customer.get("email") or data.get("email") or "").strip().lower()
+    email = (customer.get("email") or data.get("email") or data.get("customer_email") or "").strip().lower()
 
     if not email:
         return {"received": True, "note": "no email"}
 
-    active_events = {"compra_aprovada", "subscription_renewed"}
-    inactive_events = {"subscription_canceled", "subscription_late", "chargeback"}
+    # Eventos possíveis (podem variar; se precisar, você ajusta depois)
+    active_events = {
+        "compra_aprovada",
+        "purchase_approved",
+        "compra_aprovada_pix",
+        "subscription_renewed",
+        "assinatura_renovada",
+    }
+    inactive_events = {
+        "subscription_canceled",
+        "assinatura_cancelada",
+        "subscription_late",
+        "chargeback",
+        "reembolso",
+        "refund",
+    }
 
     new_active = None
     if event in active_events:
@@ -109,8 +151,11 @@ async def kiwify_webhook(request: Request):
         new_active = False
 
     if new_active is None:
+        # deixa log pra você descobrir o nome exato do evento
+        print(f"[KIWIFY] evento ignorado: {event} | email={email}")
         return {"received": True, "note": f"ignored event: {event}"}
 
+    # Grava no banco
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -124,41 +169,5 @@ async def kiwify_webhook(request: Request):
     finally:
         conn.close()
 
-    return {"received": True, "email": email, "active": new_active}
-    data = await request.json()
-
-    event = data.get("event") or data.get("type") or ""
-    customer = data.get("customer", {}) or {}
-    email = (customer.get("email") or data.get("email") or "").strip().lower()
-
-    if not email:
-        return {"received": True, "note": "no email"}
-
-    active_events = {"compra_aprovada", "subscription_renewed"}
-    inactive_events = {"subscription_canceled", "subscription_late", "chargeback"}
-
-    new_active = None
-    if event in active_events:
-        new_active = True
-    elif event in inactive_events:
-        new_active = False
-
-    if new_active is None:
-        return {"received": True, "note": f"ignored event: {event}"}
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO subscriptions (email, active, updated_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (email)
-                DO UPDATE SET active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
-            """, (email, new_active, datetime.utcnow()))
-            conn.commit()
-    finally:
-        conn.close()
-
-    return {"received": True, "email": email, "active": new_active}
-
-
+    print(f"[KIWIFY] OK: {email} -> active={new_active} (event={event})")
+    return {"received": True, "email": email, "active": new_active, "event": event}
