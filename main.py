@@ -66,11 +66,26 @@ def status(email: str):
 
 @app.post("/webhook/kiwify")
 async def kiwify_webhook(request: Request):
-    # Se você quiser proteger, passe um token no header:
-    # Ex: X-Webhook-Token: <seu_token>
+    # Kiwify normalmente envia o token como ?signature=... (querystring)
+    # Seu código antigo esperava X-Webhook-Token no header, por isso dava 401.
     if WEBHOOK_TOKEN:
-        token = request.headers.get("X-Webhook-Token", "")
-        if token != WEBHOOK_TOKEN:
+        qs_sig = request.query_params.get("signature", "").strip()
+        hdr_sig = (request.headers.get("X-Webhook-Token", "") or "").strip()
+        hdr_auth = (request.headers.get("Authorization", "") or "").strip()
+
+        # Aceita se QUALQUER um bater:
+        # - query param signature
+        # - header X-Webhook-Token
+        # - header Authorization: Bearer <token>
+        ok = False
+        if qs_sig and qs_sig == WEBHOOK_TOKEN:
+            ok = True
+        elif hdr_sig and hdr_sig == WEBHOOK_TOKEN:
+            ok = True
+        elif hdr_auth.lower().startswith("bearer ") and hdr_auth.split(" ", 1)[1].strip() == WEBHOOK_TOKEN:
+            ok = True
+
+        if not ok:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     data = await request.json()
@@ -108,3 +123,39 @@ async def kiwify_webhook(request: Request):
         conn.close()
 
     return {"received": True, "email": email, "active": new_active}
+    data = await request.json()
+
+    event = data.get("event") or data.get("type") or ""
+    customer = data.get("customer", {}) or {}
+    email = (customer.get("email") or data.get("email") or "").strip().lower()
+
+    if not email:
+        return {"received": True, "note": "no email"}
+
+    active_events = {"compra_aprovada", "subscription_renewed"}
+    inactive_events = {"subscription_canceled", "subscription_late", "chargeback"}
+
+    new_active = None
+    if event in active_events:
+        new_active = True
+    elif event in inactive_events:
+        new_active = False
+
+    if new_active is None:
+        return {"received": True, "note": f"ignored event: {event}"}
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO subscriptions (email, active, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email)
+                DO UPDATE SET active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
+            """, (email, new_active, datetime.utcnow()))
+            conn.commit()
+    finally:
+        conn.close()
+
+    return {"received": True, "email": email, "active": new_active}
+
