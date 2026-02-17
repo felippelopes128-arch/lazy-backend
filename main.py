@@ -15,7 +15,6 @@ WEBHOOK_TOKEN = os.getenv("KIWIFY_WEBHOOK_TOKEN", "").strip()
 # =========================
 # DATABASE
 # =========================
-
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurado.")
@@ -34,6 +33,7 @@ def init_db():
                 );
             """)
 
+            # Auditoria dos webhooks pra debug
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS webhook_events (
                     id SERIAL PRIMARY KEY,
@@ -57,7 +57,6 @@ def startup():
 # =========================
 # BASIC ROUTES
 # =========================
-
 @app.get("/")
 def root():
     return {"LazyAndDark": "API ONLINE"}
@@ -71,7 +70,6 @@ def health():
 @app.get("/status")
 def status(email: str):
     email = email.strip().lower()
-
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -80,7 +78,6 @@ def status(email: str):
                 (email,),
             )
             row = cur.fetchone()
-
             if not row:
                 return {"email": email, "active": False, "found": False}
 
@@ -97,8 +94,13 @@ def status(email: str):
 # =========================
 # TOKEN VALIDATION
 # =========================
-
 def token_ok(request: Request) -> bool:
+    """
+    Aceita token vindo de:
+    - querystring: ?signature=...  (pode vir repetido)
+    - header: X-Webhook-Token
+    - header: Authorization: Bearer <token>
+    """
     if not WEBHOOK_TOKEN:
         return True
 
@@ -122,20 +124,21 @@ def token_ok(request: Request) -> bool:
 # =========================
 # HELPERS
 # =========================
-
 def pick_email(data: dict) -> str:
     """
-    Procura o email em vários lugares possíveis do payload.
+    Procura o email em vários lugares possíveis do payload (incluindo 'Customer' com C maiúsculo).
     """
     paths = [
         ["customer", "email"],
+        ["Customer", "email"],  # <- Kiwify real no seu log
         ["buyer", "email"],
         ["order", "customer", "email"],
         ["order", "customer_email"],
         ["customer_email"],
+        ["customerEmail"],
         ["email"],
-        ["Customer", "email"],
         ["data", "customer", "email"],
+        ["data", "Customer", "email"],
     ]
 
     for path in paths:
@@ -152,22 +155,25 @@ def pick_email(data: dict) -> str:
 
 
 def normalize_event(data: dict) -> str:
+    """
+    No seu payload real, o evento vem em 'webhook_event_type' (ex: order_approved).
+    """
     ev = (
         data.get("event")
         or data.get("type")
         or data.get("evento")
         or data.get("Event")
         or data.get("name")
+        or data.get("webhook_event_type")   # <- Kiwify real no seu log
+        or data.get("order_status")         # <- fallback (ex: paid)
         or ""
     )
-
-    return ev.strip().lower().replace(" ", "_")
+    return str(ev).strip().lower().replace(" ", "_")
 
 
 # =========================
 # WEBHOOK
 # =========================
-
 @app.post("/webhook/kiwify")
 async def kiwify_webhook(request: Request):
 
@@ -179,14 +185,14 @@ async def kiwify_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # 🔥 LOGS IMPORTANTES (DEBUG)
+    # Debug leve
     print("[KIWIFY] keys:", list(data.keys()))
-    print("[KIWIFY] preview:", str(data)[:800])
+    print("[KIWIFY] preview:", str(data)[:900])
 
     event = normalize_event(data)
     email = pick_email(data)
 
-    # Auditoria sempre salva
+    # Auditoria: salva sempre o payload
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -199,29 +205,33 @@ async def kiwify_webhook(request: Request):
         conn.close()
 
     if not email:
-        print("[KIWIFY] sem email. data:", str(data)[:1200])
+        print("[KIWIFY] Recebido sem email. event=", event)
+        print("[KIWIFY] payload:", str(data)[:1500])
         return {"received": True, "note": "no email", "event": event}
 
-    # EVENTOS
+    # Eventos ativos/inativos (já adaptados ao seu payload)
     active_events = {
         "compra_aprovada",
         "purchase_approved",
         "approved",
         "subscription_renewed",
         "assinatura_renovada",
+        "order_approved",  # <- Kiwify real no seu log
+        "paid",            # <- fallback possível
     }
 
     inactive_events = {
         "subscription_canceled",
         "assinatura_cancelada",
+        "subscription_late",
         "chargeback",
         "refund",
         "reembolso",
         "canceled",
+        "refunded",
     }
 
     new_active = None
-
     if event in active_events:
         new_active = True
     elif event in inactive_events:
@@ -230,7 +240,7 @@ async def kiwify_webhook(request: Request):
         print(f"[KIWIFY] Evento ignorado: {event} | email={email}")
         return {"received": True, "note": f"ignored event: {event}", "email": email}
 
-    # SALVAR ASSINATURA
+    # Salvar assinatura
     conn = get_conn()
     try:
         with conn.cursor() as cur:
