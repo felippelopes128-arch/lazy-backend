@@ -1,6 +1,7 @@
 import os
 import json
 from datetime import datetime
+
 from fastapi import FastAPI, Request, HTTPException
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -21,15 +22,17 @@ def init_db():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     email TEXT PRIMARY KEY,
                     active BOOLEAN NOT NULL DEFAULT FALSE,
                     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
                 );
-            """)
-            # Auditoria dos webhooks (pra debug)
-            cur.execute("""
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS webhook_events (
                     id SERIAL PRIMARY KEY,
                     received_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -37,7 +40,8 @@ def init_db():
                     email TEXT,
                     raw JSONB
                 );
-            """)
+                """
+            )
             conn.commit()
     finally:
         conn.close()
@@ -64,7 +68,10 @@ def status(email: str):
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT email, active, updated_at FROM subscriptions WHERE email=%s", (email,))
+            cur.execute(
+                "SELECT email, active, updated_at FROM subscriptions WHERE email=%s",
+                (email,),
+            )
             row = cur.fetchone()
             if not row:
                 return {"email": email, "active": False, "found": False}
@@ -78,7 +85,13 @@ def status(email: str):
         conn.close()
 
 
-def _token_ok(request: Request) -> bool:
+def token_ok(request: Request) -> bool:
+    """
+    Aceita token vindo de:
+    - querystring: ?signature=...  (pode vir repetido)
+    - header: X-Webhook-Token
+    - header: Authorization: Bearer <token>
+    """
     if not WEBHOOK_TOKEN:
         return True
 
@@ -99,13 +112,12 @@ def _token_ok(request: Request) -> bool:
     return False
 
 
-def _pick_email(data: dict) -> str:
+def pick_email(data: dict) -> str:
     """
-    Tenta achar email em vários formatos que a Kiwify pode enviar.
+    Tenta encontrar e-mail em vários formatos possíveis.
     """
     candidates = []
 
-    # Formatos comuns
     customer = data.get("customer") or {}
     if isinstance(customer, dict):
         candidates.append(customer.get("email"))
@@ -113,7 +125,6 @@ def _pick_email(data: dict) -> str:
     candidates.append(data.get("email"))
     candidates.append(data.get("customer_email"))
 
-    # Outros formatos possíveis
     order = data.get("order") or {}
     if isinstance(order, dict):
         candidates.append(order.get("customer_email"))
@@ -125,7 +136,6 @@ def _pick_email(data: dict) -> str:
     if isinstance(buyer, dict):
         candidates.append(buyer.get("email"))
 
-    # Pega o primeiro válido
     for c in candidates:
         if isinstance(c, str) and "@" in c:
             return c.strip().lower()
@@ -133,15 +143,14 @@ def _pick_email(data: dict) -> str:
     return ""
 
 
-def _normalize_event(data: dict) -> str:
+def normalize_event(data: dict) -> str:
     ev = (data.get("event") or data.get("type") or data.get("evento") or "").strip()
-    ev = ev.lower().replace(" ", "_")
-    return ev
+    return ev.lower().replace(" ", "_")
 
 
 @app.post("/webhook/kiwify")
 async def kiwify_webhook(request: Request):
-    if not _token_ok(request):
+    if not token_ok(request):
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     try:
@@ -149,10 +158,66 @@ async def kiwify_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    event = _normalize_event(data)
-    email = _pick_email(data)
+    event = normalize_event(data)
+    email = pick_email(data)
 
-    # Salva auditoria sempre (pra você enxergar o que chegou)
+    # Auditoria (sempre salva o payload)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO webhook_events (event, email, raw) VALUES (%s, %s, %s)",
+                (event or None, email or None, json.dumps(data)),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    if not email:
+        print(f"[KIWIFY] Recebido sem email. event={event}")
+        return {"received": True, "note": "no email", "event": event}
+
+    active_events = {
+        "compra_aprovada",
+        "purchase_approved",
+        "subscription_renewed",
+        "assinatura_renovada",
+        "approved",
+    }
+    inactive_events = {
+        "subscription_canceled",
+        "assinatura_cancelada",
+        "subscription_late",
+        "chargeback",
+        "reembolso",
+        "refund",
+        "canceled",
+    }
+
+    new_active = None
+    if event in active_events:
+        new_active = True
+    elif event in inactive_events:
+        new_active = False
+    else:
+        print(f"[KIWIFY] Evento ignorado: {event} | email={email}")
+        return {"received": True, "note": f"ignored event: {event}", "email": email}
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscriptions (email, active, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email)
+                DO UPDATE SET active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
+                """,
+                (email, new_active, datetime.utcnow()),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    print(f"[KIWIFY] OK: {email} -> active={new_active} (event={event})")
+    return {"received": True, "email": email, "active": new_active, "event": event}
