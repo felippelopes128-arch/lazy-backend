@@ -12,9 +12,13 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 WEBHOOK_TOKEN = os.getenv("KIWIFY_WEBHOOK_TOKEN", "").strip()
 
 
+# =========================
+# DATABASE
+# =========================
+
 def get_conn():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurado no Render.")
+        raise RuntimeError("DATABASE_URL não configurado.")
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
@@ -22,17 +26,15 @@ def init_db():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS subscriptions (
                     email TEXT PRIMARY KEY,
                     active BOOLEAN NOT NULL DEFAULT FALSE,
                     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
                 );
-                """
-            )
-            cur.execute(
-                """
+            """)
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS webhook_events (
                     id SERIAL PRIMARY KEY,
                     received_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -40,17 +42,21 @@ def init_db():
                     email TEXT,
                     raw JSONB
                 );
-                """
-            )
+            """)
+
             conn.commit()
     finally:
         conn.close()
 
 
 @app.on_event("startup")
-def on_startup():
+def startup():
     init_db()
 
+
+# =========================
+# BASIC ROUTES
+# =========================
 
 @app.get("/")
 def root():
@@ -65,6 +71,7 @@ def health():
 @app.get("/status")
 def status(email: str):
     email = email.strip().lower()
+
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -73,8 +80,10 @@ def status(email: str):
                 (email,),
             )
             row = cur.fetchone()
+
             if not row:
                 return {"email": email, "active": False, "found": False}
+
             return {
                 "email": row["email"],
                 "active": bool(row["active"]),
@@ -85,13 +94,11 @@ def status(email: str):
         conn.close()
 
 
+# =========================
+# TOKEN VALIDATION
+# =========================
+
 def token_ok(request: Request) -> bool:
-    """
-    Aceita token vindo de:
-    - querystring: ?signature=...  (pode vir repetido)
-    - header: X-Webhook-Token
-    - header: Authorization: Bearer <token>
-    """
     if not WEBHOOK_TOKEN:
         return True
 
@@ -100,7 +107,7 @@ def token_ok(request: Request) -> bool:
         return True
 
     hdr_sig = (request.headers.get("X-Webhook-Token", "") or "").strip()
-    if hdr_sig and hdr_sig == WEBHOOK_TOKEN:
+    if hdr_sig == WEBHOOK_TOKEN:
         return True
 
     hdr_auth = (request.headers.get("Authorization", "") or "").strip()
@@ -112,44 +119,58 @@ def token_ok(request: Request) -> bool:
     return False
 
 
+# =========================
+# HELPERS
+# =========================
+
 def pick_email(data: dict) -> str:
     """
-    Tenta encontrar e-mail em vários formatos possíveis.
+    Procura o email em vários lugares possíveis do payload.
     """
-    candidates = []
+    paths = [
+        ["customer", "email"],
+        ["buyer", "email"],
+        ["order", "customer", "email"],
+        ["order", "customer_email"],
+        ["customer_email"],
+        ["email"],
+        ["Customer", "email"],
+        ["data", "customer", "email"],
+    ]
 
-    customer = data.get("customer") or {}
-    if isinstance(customer, dict):
-        candidates.append(customer.get("email"))
-
-    candidates.append(data.get("email"))
-    candidates.append(data.get("customer_email"))
-
-    order = data.get("order") or {}
-    if isinstance(order, dict):
-        candidates.append(order.get("customer_email"))
-        cust2 = order.get("customer") or {}
-        if isinstance(cust2, dict):
-            candidates.append(cust2.get("email"))
-
-    buyer = data.get("buyer") or {}
-    if isinstance(buyer, dict):
-        candidates.append(buyer.get("email"))
-
-    for c in candidates:
-        if isinstance(c, str) and "@" in c:
-            return c.strip().lower()
+    for path in paths:
+        ref = data
+        for key in path:
+            if isinstance(ref, dict):
+                ref = ref.get(key)
+            else:
+                ref = None
+        if isinstance(ref, str) and "@" in ref:
+            return ref.strip().lower()
 
     return ""
 
 
 def normalize_event(data: dict) -> str:
-    ev = (data.get("event") or data.get("type") or data.get("evento") or "").strip()
-    return ev.lower().replace(" ", "_")
+    ev = (
+        data.get("event")
+        or data.get("type")
+        or data.get("evento")
+        or data.get("Event")
+        or data.get("name")
+        or ""
+    )
 
+    return ev.strip().lower().replace(" ", "_")
+
+
+# =========================
+# WEBHOOK
+# =========================
 
 @app.post("/webhook/kiwify")
 async def kiwify_webhook(request: Request):
+
     if not token_ok(request):
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
@@ -158,10 +179,14 @@ async def kiwify_webhook(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
+    # 🔥 LOGS IMPORTANTES (DEBUG)
+    print("[KIWIFY] keys:", list(data.keys()))
+    print("[KIWIFY] preview:", str(data)[:800])
+
     event = normalize_event(data)
     email = pick_email(data)
 
-    # Auditoria (sempre salva o payload)
+    # Auditoria sempre salva
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -174,27 +199,29 @@ async def kiwify_webhook(request: Request):
         conn.close()
 
     if not email:
-        print(f"[KIWIFY] Recebido sem email. event={event}")
+        print("[KIWIFY] sem email. data:", str(data)[:1200])
         return {"received": True, "note": "no email", "event": event}
 
+    # EVENTOS
     active_events = {
         "compra_aprovada",
         "purchase_approved",
+        "approved",
         "subscription_renewed",
         "assinatura_renovada",
-        "approved",
     }
+
     inactive_events = {
         "subscription_canceled",
         "assinatura_cancelada",
-        "subscription_late",
         "chargeback",
-        "reembolso",
         "refund",
+        "reembolso",
         "canceled",
     }
 
     new_active = None
+
     if event in active_events:
         new_active = True
     elif event in inactive_events:
@@ -203,21 +230,25 @@ async def kiwify_webhook(request: Request):
         print(f"[KIWIFY] Evento ignorado: {event} | email={email}")
         return {"received": True, "note": f"ignored event: {event}", "email": email}
 
+    # SALVAR ASSINATURA
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO subscriptions (email, active, updated_at)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (email)
                 DO UPDATE SET active=EXCLUDED.active, updated_at=EXCLUDED.updated_at
-                """,
-                (email, new_active, datetime.utcnow()),
-            )
+            """, (email, new_active, datetime.utcnow()))
             conn.commit()
     finally:
         conn.close()
 
     print(f"[KIWIFY] OK: {email} -> active={new_active} (event={event})")
-    return {"received": True, "email": email, "active": new_active, "event": event}
+
+    return {
+        "received": True,
+        "email": email,
+        "active": new_active,
+        "event": event
+    }
