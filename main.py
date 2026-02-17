@@ -69,7 +69,9 @@ async def kiwify_webhook(request: Request):
     # Kiwify normalmente envia o token como ?signature=... (querystring)
     # Seu código antigo esperava X-Webhook-Token no header, por isso dava 401.
     if WEBHOOK_TOKEN:
-        qs_sig = request.query_params.get("signature", "").strip()
+        qs_sigs = [s.strip() for s in request.query_params.getlist("signature") if s]
+        qs_sig_ok = WEBHOOK_TOKEN in qs_sigs
+
         hdr_sig = (request.headers.get("X-Webhook-Token", "") or "").strip()
         hdr_auth = (request.headers.get("Authorization", "") or "").strip()
 
@@ -158,4 +160,5 @@ async def kiwify_webhook(request: Request):
         conn.close()
 
     return {"received": True, "email": email, "active": new_active}
+
 
